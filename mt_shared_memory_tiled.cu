@@ -1,18 +1,3 @@
-/*
- *  Copyright 2014 NVIDIA Corporation
- *
- *  Licensed under the Apache License, Version 2.0 (the "License");
- *  you may not use this file except in compliance with the License.
- *  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- *  Unless required by applicable law or agreed to in writing, software
- *  distributed under the License is distributed on an "AS IS" BASIS,
- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *  See the License for the specific language governing permissions and
- *  limitations under the License.
- */
 
  #include <stdio.h>
  #include <math.h>
@@ -51,7 +36,7 @@
      
  /* declare a shared memory array */
  
-   __shared__ double smemArray[THREADS_PER_BLOCK_X][THREADS_PER_BLOCK_Y];
+   __shared__ double smemArray[THREADS_PER_BLOCK_X][THREADS_PER_BLOCK_Y + 1];
      
  /* determine my row and column indices for the error checking code */
  
@@ -195,8 +180,7 @@
  /* call smem GPU transpose kernel */
  
    smem_cuda_transpose<<< blocks, threads >>>( size, d_a, d_c );
-   CUDA_CHECK();
-   CUDA_CALL( cudaDeviceSynchronize() );
+   
  
  /* stop the timers */
  

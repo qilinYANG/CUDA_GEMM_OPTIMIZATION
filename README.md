@@ -88,7 +88,42 @@ NVIDIA Nsight Compute profiles and roofline analysis are used to connect each co
 
 ### Tensor Core Acceleration
 
-Planned: explore Tensor Core GEMM and compare its throughput and numerical accuracy with the FP32 implementations, documenting the input and accumulation precision used.
+This stage uses **FP16 inputs with FP32 accumulation and output** on the **NVIDIA A100-SXM4-40GB**. The development measurements below use **M = N = K = 8192**, unlike the 1024³ FP32 experiments above. They represent successive tuning runs, rather than a controlled comparison of every version under identical conditions.
+
+> **From WMMA to a Pipelined Kernel**
+>
+> - Start with `wmma::load_matrix_sync` and `wmma::mma_sync`, staging operands in shared memory. Early implementations achieved approximately **15–23 TFLOP/s**.
+> - Introduce asynchronous global-to-shared copies with `cp.async` and two shared-memory buffers. Prefetch the next K tile while computing the current tile, reaching approximately **66 TFLOP/s** during development.
+> - Expand each warp's output tile to **32×32**, reusing operand fragments across multiple matrix multiply-accumulate operations. Experiments with fragment-load pipelining brought throughput to approximately **122 TFLOP/s**.
+>
+> **Shared-Memory Layout Redesign**
+>
+> - Profiling exposed excessive shared-memory wavefronts on `LDGSTS` copies, alongside barrier stalls. Padding that helped matrix reads did not necessarily help copy destinations.
+> - Replace the padded layout with an **XOR permutation of 16-byte chunks**, using the same address mapping for copy destinations and matrix reads. Each chunk remains contiguous and aligned.
+> - Use explicit `ldmatrix` and `mma.sync.aligned.m16n8k16` instructions to consume the swizzled layout. The implementation remains custom CUDA/PTX, with cuBLAS used as a reference.
+> - The redesign initially regressed to approximately **113 TFLOP/s**: improving a memory layout alone did not guarantee a faster kernel.
+>
+> **Register Pressure and Scheduling**
+>
+> - The current configuration uses a **128×128 block tile**, **32×32 per warp**, and **512 threads per block**, with **BK=64** by default.
+> - At **72 registers per thread**, the register budget permitted only one such block per SM. Removing explicit fragment double buffering alone left allocation at 72 registers.
+> - Disabling unrolling of the inner K-step loop with `#pragma unroll 1` reduced allocation to **64 registers per thread**. This permits two blocks per SM from the register-budget perspective; actual residency also depends on shared memory and other limits.
+> - The current kernel retains **shared-memory double buffering** and uses a **single set of operand fragments**. The experiment illustrates the tradeoff between instruction overlap, register lifetimes, and resident warps.
+>
+> **Observed Performance and Validation**
+>
+> - Latest reported throughput outside Nsight Compute: approximately **143 TFLOP/s**, measured with CUDA events. For 8192³, this corresponds to approximately **7.69 ms** using `2MNK / time`.
+> - The corresponding reported Tensor Core roofline result was approximately **122 TFLOP/s**. Keep these measurements separate: profiler clock control, cache state, and replay conditions can differ from normal execution. Use repeated unprofiled runs to compare kernel speed and profiler reports to investigate bottlenecks.
+> - Earlier cuBLAS runs reached approximately **264–286 TFLOP/s**, providing a reference for remaining headroom rather than a matched speedup ratio for the latest kernel.
+> - The benchmark checks outputs against `cublasGemmEx` using FP16 operands and FP32 compute/output. Its current acceptance rule is `abs(error) <= 0.05 + 0.005 * abs(reference)`, with non-finite results rejected. This checks agreement on the same quantized inputs, not equivalence to full-FP32 input arithmetic.
+>
+> **Lessons and Remaining Work**
+>
+> - Larger BK, fewer bank conflicts, and higher occupancy are intermediate tuning targets; **kernel execution time determines whether a change helps**.
+> - Further comparisons should hold matrix shape, precision, compiler flags, and timing conditions constant, and record register usage, spills, shared-memory allocation, and stall metrics.
+> - Validate boundary shapes and benchmark multiple matrix sizes before treating the large-square result as representative.
+
+Implementation: [swizzled Tensor Core GEMM](GEMM/gemm_tensor_core.cu). The [previous WMMA implementation](GEMM/gemm_tensor_core_wmma_baseline.cu) is retained for comparison, with [CPU layout checks](GEMM/tests/check_swizzled_layout.py) and a [GPU validation script](GEMM/tests/check_swizzled_gpu.sh).
 
 ## Tile Quantization on Register-Tiling
 

@@ -315,7 +315,7 @@ bool compare(const std::vector<float>& got, const std::vector<float>& ref,
     for (int j = 0; j < N; ++j) {
       const size_t idx = static_cast<size_t>(i) * leading_dim + j;
       const double abs_err = std::abs(static_cast<double>(got[idx]) - ref[idx]);
-      const double rel_err = abs_err / std::max(1.0e-6, std::abs(static_cast<double>(ref[idx])));
+      const double rel_err = abs_err / std::max(1.0e-7, std::abs(static_cast<double>(ref[idx])));
       max_abs = std::max(max_abs, abs_err);
       max_rel = std::max(max_rel, rel_err);
       if (!std::isfinite(got[idx]) || !std::isfinite(ref[idx]) ||
@@ -349,7 +349,7 @@ int main(int argc, char** argv) {
 
   // Pad to 16 so vector copies are entirely in/out of bounds, including tails.
   const int Mp = round_up(M, MMA_M);
-  const int Np = round_up(N, 16); // Preserve 16-half vector-copy boundaries.
+  const int Np = round_up(N, MMA_N); // Preserve 16-half vector-copy boundaries.
   const int Kp = round_up(K, MMA_K);
   const size_t a_count = static_cast<size_t>(Mp) * Kp;
   const size_t b_count = static_cast<size_t>(Kp) * Np;
