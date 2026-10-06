@@ -201,8 +201,10 @@ __global__ void tensor_core_gemm_kernel(const half* __restrict__ A,
         #pragma unroll
         for (int i = 0; i < 2; ++i) {
           #pragma unroll
-          for (int j = 0; j < 4; ++j)
+          for (int j = 0; j < 4; ++j){
             mma_16x8(acc[i][j], a[i].x, &b[j / 2].x[(j & 1) * 2]);
+          }
+            
         }
       }
     }

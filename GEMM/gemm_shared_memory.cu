@@ -1,30 +1,47 @@
-#include <stdio.h>
-#include <math.h>
+#include <cuda_runtime.h>
+#include <algorithm>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
+#include <random>
+#include <vector>
 #include <cublas_v2.h>
+#include <cmath>
 
-#ifdef DEBUG
-#define CUDA_CALL(F)  if( (F) != cudaSuccess ) \
-  {printf("Error %s at %s:%d\n", cudaGetErrorString(cudaGetLastError()), \
-   __FILE__,__LINE__); exit(-1);} 
-#define CUDA_CHECK()  if( (cudaPeekAtLastError()) != cudaSuccess ) \
-  {printf("Error %s at %s:%d\n", cudaGetErrorString(cudaGetLastError()), \
-   __FILE__,__LINE__-1); exit(-1);} 
-#else
-#define CUDA_CALL(F) (F)
-#define CUDA_CHECK() 
-#endif
+ #define CUDA_CHECK(call)                                                        \
+  do {                                                                          \
+    cudaError_t status_ = (call);                                                \
+    if (status_ != cudaSuccess) {                                                \
+      std::cerr << "CUDA error at " << __FILE__ << ':' << __LINE__ << ": "      \
+                << cudaGetErrorString(status_) << '\n';                         \
+      std::exit(EXIT_FAILURE);                                                   \
+    }                                                                           \
+  } while (0)
+
+#define CUBLAS_CHECK(call)                                                      \
+  do {                                                                          \
+    cublasStatus_t status_ = (call);                                             \
+    if (status_ != CUBLAS_STATUS_SUCCESS) {                                      \
+      std::cerr << "cuBLAS error " << static_cast<int>(status_) << " at "        \
+                << __FILE__ << ':' << __LINE__ << '\n';                         \
+      std::exit(EXIT_FAILURE);                                                   \
+    }                                                                           \
+  } while (0)
 
 
-#define THREAD_PER_BLOCK_X 32
-#define THREAD_PER_BLOCK_Y 32
-#define TILESIZE 32
+constexpr int THREAD_PER_BLOCK_X = 32;
+constexpr int THREAD_PER_BLOCK_Y = 32;
+constexpr int TILESIZE = 32;
+constexpr int WARM_UP = 1;
 
-#define M 1024
-#define N 1024
-#define K 1024
+static_assert(THREAD_PER_BLOCK_X == TILESIZE, "blockDim.x != TILESIZE");
+static_assert(THREAD_PER_BLOCK_Y == TILESIZE, "blockDim.x != TILESIZE");
+static_assert(TILESIZE * TILESIZE <= 1024, "Too large Tile size");
 
-
-__global__ void shared_memory_gemm_kernel(float *a, float *b, float *c)
+__global__ void shared_memory_gemm_kernel(const float* __restrict__ A, 
+                                          const float* __restrict__ B, 
+                                          float* __restrict__ C,
+                                          int M, int N, int K)
 {
 
     __shared__ float smemA[TILESIZE][TILESIZE + 1];
@@ -47,7 +64,7 @@ __global__ void shared_memory_gemm_kernel(float *a, float *b, float *c)
         int ACOL = cIdx * TILESIZE + tx;
         if(row < M && ACOL < K)
         {
-            smemA[ty][tx] = a[row * K + ACOL];
+            smemA[ty][tx] = A[row * K + ACOL];
         }
         else
         {
@@ -57,7 +74,7 @@ __global__ void shared_memory_gemm_kernel(float *a, float *b, float *c)
         int BROW = cIdx * TILESIZE +ty;
         if(col < N && BROW < K)
         {
-            smemB[ty][tx] = b[BROW * N + col ];
+            smemB[ty][tx] = B[BROW * N + col ];
         }
         else
         {
@@ -77,164 +94,220 @@ __global__ void shared_memory_gemm_kernel(float *a, float *b, float *c)
 
     if ( row < M && col < N )
     {
-        c[row * N + col] = sum;
+        C[row * N + col] = sum;
     }
     
 }
+
+int round_up(int x, int multiple){
+    return ((x + multiple - 1) / multiple) * multiple;
+}
+
+float benchmark_smem_gemm(const float* A, const float* B, float* C,
+                        int M, int N, int K, int iterations){
+
+    dim3 threads( THREAD_PER_BLOCK_X, THREAD_PER_BLOCK_Y, 1);
+    dim3 blocks( ( N  + THREAD_PER_BLOCK_X - 1) / THREAD_PER_BLOCK_X ,
+                ( M  + THREAD_PER_BLOCK_Y - 1) / THREAD_PER_BLOCK_Y , 1 );
+
+    for(int i = 0; i < WARM_UP; i++){
+        shared_memory_gemm_kernel<<<blocks, threads>>>(A, B, C, M, N, K);
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start));
+    for(int i = 0; i < iterations; i++){
+        shared_memory_gemm_kernel<<<blocks, threads>>>(A, B, C, M, N, K);
+    }
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    CUDA_CHECK(cudaGetLastError());
+
+    float total_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    return total_ms / iterations;
+
+}
+
+float benchmark_cublas(cublasHandle_t handle, const float* A, const float* B,
+    float* C, int M, int N, int K, int iterations) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    // cuBLAS is column-major. Row-major C=A*B is evaluated as C^T=B^T*A^T.
+    auto launch = [&]() {
+    CUBLAS_CHECK(cublasSgemm(
+        handle, CUBLAS_OP_N, CUBLAS_OP_N,
+        N, M, K, &alpha,
+        B, N,   // swapped: B first
+        A, K,
+        &beta, C, N));
+    };
+    
+
+    for (int i = 0; i < WARM_UP; ++i) launch();
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start));
+    for (int i = 0; i < iterations; ++i) launch();
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float total_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return total_ms / iterations;
+}
+
+bool compare(const std::vector<float>& got, const std::vector<float>& ref,
+    int M, int N, int leading_dim) {
+    
+    double max_abs = 0.0;
+    double max_rel = 0.0;
+    size_t failures = 0;
+    for (int i = 0; i < M; ++i) {
+        for (int j = 0; j < N; ++j) {
+            const size_t idx = static_cast<size_t>(i) * leading_dim + j;
+            double actual = static_cast<double>(got[idx]);
+            double expected = static_cast<double>(ref[idx]);
+            const double atol = 2e-5;
+            const double rtol = 1e-3;
+
+            if (!std::isfinite(actual) || !std::isfinite(expected)) {
+                if (failures < 10) {
+                    std::cout << "Non-finite at (" << i << ", " << j << ")"
+                              << ": actual=" << actual
+                              << ", expected=" << expected << '\n';
+                }
+                ++failures;
+                continue;
+            }
+            
+
+            const double abs_err = std::abs(actual - expected);
+            const double allowed = atol + rtol * std::abs(expected);
+            const double rel_err =
+            abs_err / std::max(1e-7, std::abs(expected));
+
+            max_abs = std::max(max_abs, abs_err);
+            max_rel = std::max(max_rel, rel_err);
+
+            if (abs_err > allowed) {
+                if (failures < 10) {
+                    std::cout << std::scientific << std::setprecision(9)
+                              << "Mismatch at (" << i << ", " << j << ")"
+                              << ": actual=" << actual
+                              << ", expected=" << expected
+                              << ", abs_error=" << abs_err
+                              << ", allowed=" << allowed << '\n';
+                }
+                ++failures;
+                        
+            }
+        }
+    }
+    std::cout << "Correctness vs cuBLAS: " << (failures == 0 ? "PASS" : "FAIL")
+    << " (failed=" << failures << ", max_abs=" << max_abs
+    << ", max_rel=" << max_rel << ")\n";
+    return failures == 0;
+    }
 
 
 
 int main( int argc, char *argv[] ){
 
-    /* Declaing Pointer for Array*/
-    float *h_a, *h_b, *h_c, *h_c_ref;
-    float *d_a, *d_b, *d_c, *d_c_ref;
+    int M = argc > 1 ? std::atoi(argv[1]) : 512;
+    int N = argc > 2 ? std::atoi(argv[2]) : 512;
+    int K = argc > 3 ? std::atoi(argv[3]) : 512;
+    int iterations = argc > 4 ? std::atoi(argv[4]) : 10;
 
-    size_t numbytes_a = M * K * sizeof(float);
-    size_t numbytes_b = K * N * sizeof(float);
-    size_t numbytes_c = M * N * sizeof(float);
-
-
-    /* Allocating Host Memory */
-
-    h_a = (float *) malloc( numbytes_a );
-    if( h_a == NULL )
-    {
-        fprintf(stderr,"Error in host malloc h_a\n");
-        return 911;
+    if (M <= 0 || N <= 0 || K <= 0 || iterations <= 0) {
+        std::cerr << "Usage: " << argv[0] << " [M N K iterations], all positive\n";
+        return EXIT_FAILURE;
     }
+ 
+    cudaDeviceProp prop{};
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
 
-    h_b = (float *) malloc( numbytes_b );
+    const int Mp = round_up(M, 32);
+    const int Np = round_up(N, 32);
+    const int Kp = round_up(K, 32);
 
-    if( h_b == NULL)
-    {
-        fprintf(stderr, "Error in host malloc h_b\n");
-        return 911;
-    }
+    const size_t a_count = static_cast<size_t>(Mp) * Kp;
+    const size_t b_count = static_cast<size_t>(Kp) * Np;
+    const size_t c_count = static_cast<size_t>(Mp) * Np;
+
+    std::vector<float> h_A(a_count, 0.0f);
+    std::vector<float> h_B(b_count, 0.0f);
     
-    h_c = (float *)malloc( numbytes_c );
 
-    if ( h_c == NULL)
-    {
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (int i = 0; i < M; ++i)
+     for (int k = 0; k < K; ++k)
+        h_A[static_cast<size_t>(i) * Kp + k] = dist(rng);
+    for (int k = 0; k < K; ++k)
+        for (int j = 0; j < N; ++j)
+        h_B[static_cast<size_t>(k) * Np + j] = dist(rng);
 
-        fprintf(stderr, "Error in host malloc h_b\n");
-        return 911;
+    float *d_A, *d_B, *d_C, *d_ref;
 
-    }
-
-    h_c_ref = (float *)malloc( numbytes_c );
-
-    if ( h_c_ref == NULL)
-    {
-
-        fprintf(stderr, "Error in host malloc h_b\n");
-        return 911;
-
-    }
-
-    CUDA_CALL(cudaMalloc( (void**) &d_a, numbytes_a ) );
-    CUDA_CALL(cudaMalloc( (void**) &d_b, numbytes_b ) );
-    CUDA_CALL(cudaMalloc( (void**) &d_c, numbytes_c ) );
-
-    CUDA_CALL(cudaMalloc( (void**) &d_c_ref, numbytes_c ) );
-
-    memset( h_c, 0, numbytes_c );
-    CUDA_CALL( cudaMemset( d_c, 0, numbytes_c ) );
-
-    memset( h_c_ref, 0, numbytes_c );
-    CUDA_CALL( cudaMemset( d_c_ref, 0, numbytes_c ) );
+    CUDA_CHECK(cudaMalloc(&d_A, a_count * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_B, b_count * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_C, c_count * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_ref, c_count * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_A, h_A.data(), a_count * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, h_B.data(), b_count * sizeof(float), cudaMemcpyHostToDevice));
 
 
-    for( int i = 0; i < M * K; i++ )
-    {
-        h_a[i] = float( rand() ) / ( float(RAND_MAX) + 1.0 );
-    } 
-
-    for( int i = 0; i < K * N; i++)
-    {
-        h_b[i] = float( rand() ) / ( float(RAND_MAX) + 1.0);
-    }
-
-    CUDA_CALL( cudaMemcpy( d_a, h_a, numbytes_a, cudaMemcpyHostToDevice ) );
-    CUDA_CALL( cudaMemcpy( d_b, h_b, numbytes_b, cudaMemcpyHostToDevice ) );
- 
- 
-    cudaEvent_t start, stop;
-    CUDA_CALL( cudaEventCreate( &start) );
-    CUDA_CALL( cudaEventCreate( &stop) );
-
-    dim3 threads( THREAD_PER_BLOCK_X, THREAD_PER_BLOCK_Y, 1);
-    dim3 blocks( ( N  + THREAD_PER_BLOCK_X - 1) / THREAD_PER_BLOCK_X ,
-                 ( M  + THREAD_PER_BLOCK_Y - 1) / THREAD_PER_BLOCK_Y , 1 );
-
-    CUDA_CALL( cudaEventRecord( start, 0) );
-
-    shared_memory_gemm_kernel<<<blocks, threads>>>(d_a, d_b, d_c);
-    CUDA_CHECK();
-    CUDA_CALL( cudaDeviceSynchronize() );
-
-    CUDA_CALL( cudaEventRecord( stop, 0 ) );
-    CUDA_CALL( cudaEventSynchronize( stop ) );
-    float elapsedTime;
-    CUDA_CALL( cudaEventElapsedTime( &elapsedTime, start, stop ) );
-
-    fprintf(stdout, "Total time GPU is %f sec\n", elapsedTime / 1000.0f );
-
-    CUDA_CALL( cudaMemcpy( h_c, d_c, numbytes_c, cudaMemcpyDeviceToHost ) );
-
-    // use cuBLAS for verification 
     cublasHandle_t handle;
-    cublasCreate( &handle );
+    CUBLAS_CHECK(cublasCreate(&handle));
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH));
 
-    float alpha = 1.0, beta = 0.0;
+    const float smem_gemm_ms = benchmark_smem_gemm(d_A, d_B, d_C, Mp, Np, Kp, iterations);
+    const float cublas_ms = benchmark_cublas(handle, d_A, d_B, d_ref,
+                                            Mp, Np, Kp, iterations);
 
+    std::vector<float> h_C(c_count, 0.0f), h_ref(c_count, 0.0f);
+    CUDA_CHECK(cudaMemcpy(h_C.data(), d_C, c_count * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_ref.data(), d_ref, c_count * sizeof(float), cudaMemcpyDeviceToHost));
 
-    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-        N, M, K, &alpha,
-        d_b, N,   // swapped: B first
-        d_a, K,
-        &beta, d_c_ref, N);
+    std::cout << "GPU: " << prop.name << " (SM " << prop.major << '.' << prop.minor << ")\n"
+                << "Logical shape: M=" << M << ", N=" << N << ", K=" << K << '\n'
+                << "Executed shape: M=" << Mp << ", N=" << Np << ", K=" << Kp << '\n';
+    const bool correct = compare(h_C, h_ref, M, N, Np);
 
-    cudaDeviceSynchronize();
-    cublasDestroy( handle );
+    const double logical_flops = 2.0 * M * static_cast<double>(N) * K;
+    const double executed_flops = 2.0 * Mp * static_cast<double>(Np) * Kp;
+    auto tflops = [](double flops, float ms) { return flops / (ms * 1.0e9); };
+    std::cout << std::fixed << std::setprecision(3)
+                << " smem gemm: " << smem_gemm_ms << " ms, " << tflops(logical_flops, smem_gemm_ms)
+                << " effective TFLOP/s, " << tflops(executed_flops, smem_gemm_ms)
+                << " executed TFLOP/s\n"
+                << "cuBLAS: " << cublas_ms << " ms, " << tflops(logical_flops, cublas_ms)
+                << " effective TFLOP/s\n";
 
-    CUDA_CALL( cudaMemcpy(h_c_ref, d_c_ref, numbytes_c, cudaMemcpyDeviceToHost ) );
+    CUBLAS_CHECK(cublasDestroy(handle));
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_B));
+    CUDA_CHECK(cudaFree(d_C));
+    CUDA_CHECK(cudaFree(d_ref));
+    return correct ? EXIT_SUCCESS : EXIT_FAILURE;
 
-     for( int col = 0; col < M; col++ )
-    {
-     for( int row = 0; row < N; row++ )
-     {
-        float actual = h_c[col*N+row];
-        float expected = h_c_ref[col*N+row];
-
-        float diff = fabsf(actual - expected);
-        float relErr = diff / (fabsf(expected) + 1e-6f);
-        if( !isfinite(actual) || !isfinite(expected) ||relErr > 1e-3f )   // reasonable tolerance for fp32 GEMM with K~1000
-        {
-            printf("Mismatch in position rowIdx: %d,colIdx: %d\n", col,row );
-            printf("gemm_register_tiling %f, reference %f\n",actual, expected);
-            printf("FAIL\n");
-            goto end;
-        }
-    
-     } 
-    } 
- /* free the memory */
-   printf("PASS\n");
-
-   end:
-   free( h_a );
-   free( h_b );
-   free( h_c );
-   free( h_c_ref );
-   CUDA_CALL( cudaFree( d_a ) );
-   CUDA_CALL( cudaFree( d_b ) );
-   CUDA_CALL( cudaFree( d_c ) );
-   CUDA_CALL( cudaFree( d_c_ref ) );
- 
-   CUDA_CALL( cudaDeviceReset() );
- 
-   return 0;
  
 
 }
