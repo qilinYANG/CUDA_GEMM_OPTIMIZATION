@@ -110,12 +110,24 @@ This stage uses **FP16 inputs with FP32 accumulation and output** on the **NVIDI
 > - Disabling unrolling of the inner K-step loop with `#pragma unroll 1` reduced allocation to **64 registers per thread**. This permits two blocks per SM from the register-budget perspective; actual residency also depends on shared memory and other limits.
 > - The current kernel retains **shared-memory double buffering** and uses a **single set of operand fragments**. The experiment illustrates the tradeoff between instruction overlap, register lifetimes, and resident warps.
 >
+> **Current Implementation**
+>
+> - A block contains **4×4 warps**. Each warp computes a 32×32 output tile with eight `m16n8k16` MMA operations per K=16 step. The MMA instruction shape is fixed by the inline PTX.
+> - `MatrixRegisters a[2], b[2]` stores two A subtiles and two B subtiles, each logically 16×16 and distributed across the warp. These array indices select subtiles, not pipeline buffers. Each lane holds four packed FP16-pair registers per subtile.
+> - A uses `ldmatrix.x4`; B uses `ldmatrix.x4.trans`. Each B subtile supplies two 16×8 MMA operands through register pairs `[0,1]` and `[2,3]`. Each A subtile is reused across four output-column groups.
+> - `acc[2][4][4]` holds **32 FP32 accumulators per thread**: two 16-row groups, four 8-column groups, and four lane-owned values per MMA tile. Results are written as aligned `float2` pairs using the MMA accumulator mapping.
+> - Two shared-memory stages overlap `cp.async.ca` copies of the next tile with computation on the current tile. Copy completion waits and block barriers protect consumption and stage reuse. The inner K-step loop stays rolled with `#pragma unroll 1`; the output-subtile loops remain unrolled.
+> - With BK=64, the A and B shared strides are **64 and 128 half elements**, respectively. The two stages require **64 KiB of dynamic shared memory**, with a 128-byte-aligned base. A's physical stride is rounded up to a multiple of 64 half elements when BK changes; `-DGEMM_BK=48` remains available for experiments.
+> - The host zero-pads **M and K to multiples of 16, and N to a multiple of 8**. This keeps the 16-byte input copies within complete eight-half chunks and the output pairs aligned. Logical dimensions are retained for validation and effective throughput reporting.
+>
 > **Observed Performance and Validation**
 >
 > - Latest reported throughput outside Nsight Compute: approximately **143 TFLOP/s**, measured with CUDA events. For 8192³, this corresponds to approximately **7.69 ms** using `2MNK / time`.
 > - The corresponding reported Tensor Core roofline result was approximately **122 TFLOP/s**. Keep these measurements separate: profiler clock control, cache state, and replay conditions can differ from normal execution. Use repeated unprofiled runs to compare kernel speed and profiler reports to investigate bottlenecks.
 > - Earlier cuBLAS runs reached approximately **264–286 TFLOP/s**, providing a reference for remaining headroom rather than a matched speedup ratio for the latest kernel.
 > - The benchmark checks outputs against `cublasGemmEx` using FP16 operands and FP32 compute/output. Its current acceptance rule is `abs(error) <= 0.05 + 0.005 * abs(reference)`, with non-finite results rejected. This checks agreement on the same quantized inputs, not equivalence to full-FP32 input arithmetic.
+> - Validation currently copies both output matrices to the CPU and compares the logical M×N region. The reported relative error uses `max(1e-7, abs(reference))` as its denominator; this floor is separate from the acceptance tolerance. GPU reduction-based validation has not been implemented.
+> - CUDA-event timing includes repeated GEMM launches after one warm-up launch and excludes output copies and validation. The printed `executed TFLOP/s` uses the host-padded dimensions; it does not count all extra MMA work on partial block or BK tiles.
 >
 > **Lessons and Remaining Work**
 >
@@ -125,10 +137,4 @@ This stage uses **FP16 inputs with FP32 accumulation and output** on the **NVIDI
 
 Implementation: [swizzled Tensor Core GEMM](GEMM/gemm_tensor_core.cu). The [previous WMMA implementation](GEMM/gemm_tensor_core_wmma_baseline.cu) is retained for comparison, with [CPU layout checks](GEMM/tests/check_swizzled_layout.py) and a [GPU validation script](GEMM/tests/check_swizzled_gpu.sh).
 
-## Tile Quantization on Register-Tiling
 
-## Wave Quantization on Register-Tiling
-
-## Results
-
-## Conclusion
